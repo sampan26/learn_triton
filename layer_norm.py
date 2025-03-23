@@ -6,8 +6,8 @@ import triton.language as tl
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-# properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index) # type: ignore
-# TOTAL_SRAM_PER_SM = properties["max_shared_mem"]
+properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index) # type: ignore
+TOTAL_SRAM_PER_SM = properties["max_shared_mem"]
 
 
 @triton.jit
@@ -150,7 +150,7 @@ class LayerNorm(torch.autograd.Function):
         rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
         y = torch.empty_like(x)
 
-        MAX_FUSED_SIZE = 65536 // x.element_size()
+        MAX_FUSED_SIZE = TOTAL_SRAM_PER_SM // x.element_size()
 
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
         
@@ -219,17 +219,16 @@ def test_layernorm_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
     x = -2.3 + 0.5 * torch.randn((M, N), dtype=dtype, device=device)
     weight = torch.rand((N, ), dtype=dtype, device=device, requires_grad=True)
     bias = torch.rand((N, ), dtype=dtype, device=device, requires_grad=True)
-    dLdy = 0.1 * torch.rand_like(x)
-
+    dLdy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
-    
+
     y_tri = layernorm(x, (N,), weight, bias, eps)
     y_ref = torch.nn.functional.layer_norm(x, (N,), weight, bias, eps).to(dtype)
     torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0) 
     print("Passed fwd")
 
     y_tri.backward(dLdy, retain_graph=True)
-    
+
     dLdx_tri, dLdw_tri, dLdb_tri = [_.grad.clone() for _ in [x, weight, bias]]
 
     x.grad, weight.grad, bias.grad = None, None, None
@@ -243,7 +242,53 @@ def test_layernorm_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
 
     print("Passed bwd")
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N'],
+        x_vals=[512 * i for i in range(2, 32)], # if you increase past 32 the kernel will break since features become larger than 64kb
+        line_arg='provider',
+        line_vals=['triton', 'torch'],
+        line_names=['Triton', 'Torch'],
+        styles=[('blue', '-'), ('green', '-')],
+        ylabel='GB/s',
+        plot_name='layer-norm-backward',
+        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}, # so we're actually only benchmarking the backward pass
+    ))
+def benchmark(M, N, dtype, provider, mode='backward', eps=1e-5, device=DEVICE):
+    # create data
+    x_shape = (M, N)
+    w_shape = (N, )
+    weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
+    bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
+    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)#, requires_grad=True)
+    dLdy = .1 * torch.randn_like(x)
+    x.requires_grad_(True) 
+        # setting this here instead of x's initial definition means the graph doesn't have to move through the -2.3 and 0.5 operations
+    quantiles = [0.5, 0.05, 0.95]
+
+    def y_fwd():
+        if provider == "triton":
+            return layernorm(x, w_shape, weight, bias, eps) 
+        if provider == "torch":
+            return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps) 
+
+    # forward pass
+    if mode == 'forward':
+        gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
+    # backward pass
+    if mode == 'backward':
+        y = y_fwd()
+        gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)  # noqa: F811, E704
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dLdy, retain_graph=True), quantiles=quantiles,
+                                                     grad_to_none=[x], rep=500)
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
+
 
 if __name__ == "__main__":
     # always run unit-tests
     test_layernorm_kernel(1151, 8192, torch.float16)
+    
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        benchmark.run(save_path='.', print_data=False)
