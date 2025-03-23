@@ -8,7 +8,7 @@ DEVICE = torch.device(f"cuda:{torch.cuda.current_device()}")
 @triton.jit
 def _seeded_dropout(
     x_ptr, output_ptr,
-    n_elements, probs,
+    n_elements, p,
     seed: int,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -27,7 +27,7 @@ def seeded_dropout(x, p, seed):
     output = torch.empty_like(x)
     assert x.is_contiguous()
     n_elements = x.numel()
-    grid = meta lambda: (triton.cdiv(n_cols / meta['BLOCK_SIZE']), )
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
     _seeded_dropout[grid](x, output, n_elements, p, seed, BLOCK_SIZE=1024)
     return output
 
